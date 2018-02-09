@@ -1,0 +1,1110 @@
+# Standard MIPS pipeline with conventional internal data forwarding.
+ #
+
+processor processor_0 highbit 31 system linux
+begin
+
+lilliput little_endian; 
+Machineid "mips_1";
+
+integer
+   exception  1,
+   _hi       32,           # Division operation HI value.
+   _lo       33,           # Division operation LO value.
+   linebreak 32,
+   #
+   check_ex   1,
+   check_mem  1,
+   check_wb   1,
+   ex_has_it  1,
+   mem_has_it 1,
+   wb_has_it  1,
+   target    32,           # Used in the branch target computation.
+   data_tmp  32,           # Used in data transfers.
+   ptemp     32,           # A temporary value register.
+   dummy     32,           # SAA (Same as above)
+   which      2,           # For passing parameters to cop branch units.
+   less       1,
+   equal      1, 
+   unordered  1;
+
+integer file dtemp[2,32];
+integer file scratch[128,32];
+integer file data_l [128,32];
+integer ex_trace;
+
+stall category
+     syscall_ref,
+     latency_f,       # Floating point latency.
+     latency_d,       # Divide latency.
+     latency_m,       # Multiply latency.
+     fpaddfull,       # Floating add pipeline is full with long latency op.
+     fpmulfull,       # Floating multiply pipeline is full with lo la op.
+     mem_ic,
+     mem_dc,
+     fl_d_dep,
+     ld_d_dep,
+     float_cc;
+
+constant  
+     use_itrace      0,   #- Set only one of them.
+     generate_itrace 0;   #
+
+# Next, each machine register mnemonic is presented together with their 
+# actual register number. For MIPS $zero and $0 are aliases, so are many
+# others. From the perspective of the machine-gen, only the association 
+# of names with numbers is important. Therefore, as many aliases as 
+# necessary can be described.
+
+external
+begin
+   int  fast_open_file(void *,char *);
+   int  fast_write_file(int,int,int *);
+   int  fast_read_file(int,int,int *);
+   int  fast_strlen(int *);
+   void perror(char *);
+   void exit(int);
+
+   char *getenv(const char *);
+   int sprintf(char *,const char *,...);
+   int printf(const char *,...);
+   void simulator_pause(void *,int);
+   int write(int,void *,int);
+   int strlen(char *);
+   int flush(int);
+end external;
+%%
+int fast_strlen(int *a)
+{
+ return strlen((char *)a);
+}
+%%
+
+register file gpr [78,32];
+register file gpr_tag [78,1];
+
+# We have to specify the name of the instruction register. The instruction
+# register is treated as a special register to allow less typing. That is,
+# ir.rt is equivalent to rt iff ir is the instruction register.
+
+instruction register ir 32;
+instruction pointer  pc 32;
+
+# Coprocessor registers
+
+#memory mem0 latency  6 width 64;
+#memory mem1 latency  6 width 128;
+memory mem2 latency  0 width 32;
+
+# This is the instruction cache.
+#
+#instruction cache icache of mem1  64 2;      # 64 kilobytes. 2 words/line
+memory icache latency 0 width 32;
+
+# This is the data cache.
+#
+#data cache dcache of mem0  64 4;              # 64 kilobytes. 4 words/line
+memory dcache latency 0 width 32;
+
+
+constant machine_drained        1;
+
+
+# This is the instruction pipeline. 
+#
+pipeline IPIPE       (s_IF, s_ID, s_EX, s_MEM, s_WB);
+pipeline FP_ADD      (f_add1, f_add2, f_add3);
+pipeline FP_MULTIPLY (f_mul1, f_mul2, f_mul3);
+
+source s_IF;
+
+
+shadow register
+       hi_val     32,
+       lo_val     32;
+
+
+latch
+   new_pc         32,
+   branch_input    1,
+   branch_target  32;
+
+# procedures that have the name of a pipeline stage are called 
+# at the beginning (prologue) or at the end (epilogue) for each
+# staged code corresponding to this stage identifier.
+
+
+controldata register
+   my_pc       32,
+   taken_branch 1,
+   decoded      1,
+   taken        1,
+   is_branch    1,
+   ls_bypass    1,
+   mem_stat     1,
+   counted      1,
+   access_type 32,
+   byte         2,
+   simm        32,     # Sign extended immediate.
+   zimm        32,     # Zero extended immediate.
+   smdr        32, 
+   store_v     32,     # Store Memory data register.
+   lmar        32,     # load memory address register.
+   smar        32,     # store memory address register.
+   dest        32,     # dest holds the value to be written.           
+   dest2       32,     # dest holds the value to be written.           
+   #
+   dest_r       5,
+   dest2_r      5,
+   lop_r        5,
+   lop2_r       5,
+   rop_r        5,   
+   rop2_r       5,
+   
+   #
+   lop         32,     # lop holds the left operand value.
+   lop2        32,     # 
+   rop         32,     # rop holds the right operand value.
+   rop2        32;     #
+     
+
+
+
+bitconstant
+   _BYTE        0 0,
+   _HALFWORD    0 1,
+   _TRIPLEBYTE  1 0,
+   _WORD        1 1;
+
+$include /local/classes/cs4431/Fast-System/Descriptions/Mips/Common/mips-instruction-set.adl
+
+integer max_color;
+integer loadstorecount 64;
+integer loadstorecount1 64;
+
+
+
+procedure wrapup untyped
+begin
+   builtin append_global(" max_color=",max_color);
+   builtin append_global(" loadstorecount=",loadstorecount);
+   builtin append_global(" loadstorecount=",loadstorecount1);
+   
+end wrapup;
+
+epilogue wrapup;
+procedure do_forwarding_to_memory untyped
+begin
+   local dr_wb;
+   local lop_s, rop_s;
+   local lop2_s, rop2_s;
+
+   lop_s  = lop_r  ^= 0;
+   lop2_s = lop2_r ^= 0;
+   rop_s  = rop_r  ^= 0;
+   rop2_s = rop2_r ^= 0;
+
+   
+   if has_context s_WB  then dr_wb  = dest_r[s_WB]  else dr_wb  = 0;
+
+   if lop_s then 
+      begin
+         if (dr_wb == lop_r)  & lop_s then 
+            lop = dest[s_WB];
+      end;
+
+   if lop2_s then 
+      begin
+         
+         if (dr_wb == lop2_r)  & lop2_s then 
+            lop2 = dest[s_WB];
+      end;
+
+   if rop_s then 
+      begin
+         
+         if (dr_wb == rop_r)  & rop_s then 
+            rop = dest[s_WB];
+      end;
+
+   if rop2_s then 
+      begin
+         
+         if (dr_wb == rop2_r)  & rop2_s then 
+            rop2 = dest[s_WB];
+      end;
+end do_forwarding_to_memory;
+
+procedure do_forwarding_to_execute untyped
+begin
+   local dr_wb;
+   local lop_s, rop_s;
+   local lop2_s, rop2_s;
+
+   lop_s  = lop_r  ^= 0;
+   lop2_s = lop2_r ^= 0;
+   rop_s  = rop_r  ^= 0;
+   rop2_s = rop2_r ^= 0;
+
+   
+   if has_context s_WB  then dr_wb  = dest_r[s_WB]  else dr_wb  = 0;
+
+   if lop_s then 
+      begin
+         if (dr_wb == lop_r)  & lop_s then 
+            lop = dest[s_WB];
+      end;
+
+   if lop2_s then 
+      begin
+         
+         if (dr_wb == lop2_r)  & lop2_s then 
+            lop2 = dest[s_WB];
+      end;
+
+   if rop_s then 
+      begin
+         
+         if (dr_wb == rop_r)  & rop_s then 
+            rop = dest[s_WB];
+      end;
+
+   if rop2_s then 
+      begin
+         
+         if (dr_wb == rop2_r)  & rop2_s then 
+            rop2 = dest[s_WB];
+      end;
+end do_forwarding_to_execute;
+
+procedure do_forwarding_to_id untyped
+begin
+   local dr_ex, dr_mem, dr_wb;
+   local lop_s, rop_s;
+   local lop2_s, rop2_s;
+
+   lop_s  = lop_r  ^= 0;
+   lop2_s = lop2_r ^= 0;
+   rop_s  = rop_r  ^= 0;
+   rop2_s = rop2_r ^= 0;
+
+   if has_context s_EX  then dr_ex  = dest_r[s_EX]  else dr_ex  = 0; 
+   if has_context s_MEM then dr_mem = dest_r[s_MEM] else dr_mem = 0;
+   if has_context s_WB  then dr_wb  = dest_r[s_WB]  else dr_wb  = 0;
+
+   if lop_s then 
+      begin
+         if (dr_ex  == lop_r) & lop_s then 
+            lop = dest[s_EX]
+         else
+         if (dr_mem == lop_r) & lop_s then
+            lop = dest[s_MEM]
+         else
+         if (dr_wb == lop_r)  & lop_s then
+            lop = dest[s_WB];
+      end;
+
+   if lop2_s then 
+      begin
+         if (dr_ex  == lop2_r) & lop2_s then 
+            lop2 = dest[s_EX]
+         else
+         if (dr_mem == lop2_r) & lop2_s then
+            lop2 = dest[s_MEM]
+         else
+         if (dr_wb == lop2_r)  & lop2_s then
+            lop2 = dest[s_WB];
+      end;
+
+   if rop_s then 
+      begin
+         if (dr_ex  == rop_r) & rop_s then
+            rop = dest[s_EX]
+         else
+         if (dr_mem == rop_r) & rop_s then
+            rop = dest[s_MEM]
+         else
+         if (dr_wb == rop_r)  & rop_s then
+            rop = dest[s_WB];
+      end;
+
+   if rop2_s then 
+      begin
+         if (dr_ex  == rop2_r) & rop2_s then
+            rop2 = dest[s_EX]
+         else
+         if (dr_mem == rop2_r) & rop2_s then
+            rop2 = dest[s_MEM]
+         else
+         if (dr_wb == rop2_r)  & rop2_s then
+            rop2 = dest[s_WB];
+      end;
+end do_forwarding_to_id;
+
+#- Instruction Fetch  - - - - - - - - - - - - - - - - - - - - - - - - -#
+#                                                                      #
+#                                                                      #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+integer waiting_drain;
+integer squash_next;
+
+procedure s_IF prologue
+begin
+   counted = 0;
+   my_pc = pc;
+   ir = icache[pc];
+   decode;           #- we are not really decoding here - this helps with debugging.
+   new_pc = pc+4;
+end s_IF;
+
+procedure s_IF epilogue
+begin
+   if send_enabled(s_ID) then
+      begin
+         send s_ID;
+
+         if (branch_input) then
+            begin
+               # builtin printf("branching to %08x\n",branch_target);
+               branch_input=0;
+               pc=branch_target;
+            end
+         else
+            pc=new_pc; 
+
+         newcontext;
+         ir = 0;
+         decode;
+         decoded = 0;
+         taken = 0;  
+      end;
+end s_IF;
+
+#- Instruction Decode - - - - - - - - - - - - - - - - - - - - - - - - -#
+#                                                                      #
+#                                                                      #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+procedure s_ID prologue
+begin
+   local load_flag_e;
+   local load_flag_m;
+
+   #  Fetch input registers. Sign extend the immediate portion.
+   #
+   # if decoded then return;
+
+   if squash_next then 
+      begin 
+        squash_next = false;
+        ir = 0; 
+        decode;
+      end;
+
+   if decoded == 0 then 
+      begin
+         decode;
+         is_branch=(i_type ==  branch_type_0) | (i_type ==  branch_type_1);
+
+         if l_dest_r  ^= none then dest_r  = ordinal(l_dest_r)  else dest_r  = 0;
+         if l_dest2_r ^= none then dest2_r = ordinal(l_dest2_r) else dest2_r = 0;
+         if l_lop_r   ^= none then lop_r   = ordinal(l_lop_r)   else lop_r   = 0;
+         if l_lop2_r  ^= none then lop2_r  = ordinal(l_lop2_r)  else lop2_r  = 0;
+         if l_rop_r   ^= none then rop_r   = ordinal(l_rop_r)   else rop_r   = 0;
+         if l_rop2_r  ^= none then rop2_r  = ordinal(l_rop2_r)  else rop2_r  = 0;
+   
+         decoded = 1;
+      end;
+
+   # Check for data hazards and read operands.
+
+   #- Safe mode.
+   #   
+   #if has_context s_EX     then stall;
+   #if has_context s_MEM    then stall;
+   #if has_context s_WB     then stall;
+   #if has_context f_add1   then stall;
+   #if has_context f_add2   then stall;
+   #if has_context f_add3   then stall;
+   #if has_context f_mul1   then stall;
+   #if has_context f_mul2   then stall;
+   #if has_context f_mul3   then stall;
+
+   if gpr_tag[dest_r] | gpr_tag[dest2_r] | gpr_tag[lop_r] | gpr_tag[lop2_r] | gpr_tag[rop_r] | gpr_tag[rop2_r] then 
+      stall fl_d_dep;
+
+   lop  = gpr [lop_r];
+   lop2 = gpr [lop2_r];
+   rop  = gpr [rop_r];
+   rop2 = gpr [rop2_r];
+
+   if has_context s_EX then
+      begin
+         if dest_type[s_EX] == special_input then stall syscall_ref;
+
+         if dest_type [s_EX] == lo_hi_register then stall;
+         load_flag_e= i_type[s_EX ] == load_type ;
+         if (lop_r ^= 0) & (dest_r[s_EX]  == lop_r) & (load_flag_e | is_branch) then
+            stall ld_d_dep; 
+
+         if (rop_r ^= 0) & (dest_r[s_EX]  == rop_r) & (load_flag_e | is_branch) then
+            stall ld_d_dep; 
+      end;
+
+   if has_context s_MEM then
+      begin
+         if dest_type[s_MEM] == special_input then stall syscall_ref;
+
+         if dest_type [s_MEM] == lo_hi_register then stall;
+         load_flag_m= i_type[s_MEM] == load_type;
+         if (lop_r ^= 0) & (dest_r[s_MEM] == lop_r) & (load_flag_m & is_branch) then
+            stall ld_d_dep;
+
+         if (rop_r ^= 0) & (dest_r[s_MEM] == rop_r) & (load_flag_m & is_branch) then
+            stall ld_d_dep;
+      end;
+
+   if has_context s_WB then
+      begin
+         if dest_type[s_WB] == special_input then stall syscall_ref;
+
+         if dest_type [s_WB] == lo_hi_register then stall;
+      end;
+   
+   if is_branch then
+      begin
+         if c_what ^= condition_z then
+            branch_target=my_pc + sign_extend_14(immediate);
+
+         if i_class == float_class then
+            begin
+               branch_input=lop == tf; # gpr[$CpC+34] == tf;
+            end
+         else
+            begin
+               do_forwarding_to_id;
+               condition_code(lop,rop);
+            end;
+         taken = branch_input;
+         if branch_input then 
+            squash_next = true;
+      end;
+end s_ID;
+
+procedure s_ID epilogue
+begin
+
+   if ((exu == integer_unit ) | (exu == load_unit) |(exu == store_unit)) & (send_enabled(s_EX) == 0) then
+      stall;
+    
+   if (exu == f_add_unit) & (send_enabled(f_add1) == 0) then
+      stall fpaddfull;
+
+   if (exu == f_mul_unit) & (send_enabled(f_mul1) == 0) then
+      stall fpmulfull;
+   
+   if (exu == integer_unit )  & (send_enabled(s_EX) == 1) & (send_enabled(s_MEM) == 1) then
+      send s_EX;
+
+   if ((exu == load_unit) |(exu == store_unit)) & (send_enabled(s_EX) == 1) & (send_enabled(s_MEM) == 1) then
+      send s_MEM;
+
+   if (dest_type == cpc_register) | (dest_type == float_register) then
+      gpr_tag[dest_r]=1
+   else
+   if dest_type == double_register then
+      begin
+         gpr_tag[dest_r]=1;
+         gpr_tag[dest2_r]=1;
+      end; 
+
+   if exu == f_add_unit then
+      send f_add1
+   else
+   if exu == f_mul_unit then
+      send f_mul1
+   else
+      send s_EX;
+end s_ID;
+
+#- Instruction Execution  - - - - - - - - - - - - - - - - - - - - - - -#
+#                                                                      #
+#                                                                      #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+procedure s_EX prologue
+begin
+   do_forwarding_to_execute;
+end s_EX;
+
+procedure s_EX epilogue
+begin
+   send s_WB;
+end s_EX;
+
+#- Memory access - - - - - - - - - - - - - - - - -  - - - - - - - - - #
+#                                                                      #
+#                                                                      #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+procedure s_MEM prologue
+begin
+  lrtl s_EX;
+  if ((exu == load_unit) | (exu == store_unit)) & (simm ^=0) & (counted ^=1) then
+   begin
+   loadstorecount1= loadstorecount1 + 1;
+   counted = 1;
+   end;
+  do_forwarding_to_memory;
+end s_MEM;
+
+procedure s_MEM epilogue
+begin
+   if exu == load_unit then
+      begin
+         if mem_stat == 0 then
+            stall;
+      end;
+   if exu == store_unit then
+      begin
+         dcache.(access_type) [smar] = smdr;
+         if access_complete == 0 then
+            stall;
+      end;
+   send s_WB;
+end s_MEM;
+
+#- Write-back - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+#                                                                      #
+#                                                                      #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - #
+
+procedure s_WB prologue
+begin 
+case dest_type of 
+   begin
+      special_input    :
+      lo_hi_register   : gpr[dest_r]=dest;
+                         gpr[dest2_r]=dest2;
+
+      integer_register : if dest_r == 0 then
+                            begin
+                               if dest ^= 0 then pause;
+                               dest = 0;
+                            end;
+                         gpr[dest_r]=dest;
+
+      cpc_register     :
+      float_register   : gpr[dest_r]=dest;  
+                         gpr_tag[dest_r]=0;
+
+      double_register  : gpr[dest_r]=dest;  
+                         gpr[dest2_r]=dest2;  
+                         gpr_tag[dest_r]=0;
+                         gpr_tag[dest2_r]=0;
+   
+   end;
+   
+  if ((i_type == load_type) | (i_type == store_type)) & (simm ^=0) then
+   begin
+   loadstorecount= loadstorecount + 1;
+   end;
+   
+end s_WB;
+
+procedure s_WB epilogue
+begin
+   if (generate_itrace) then 
+      begin
+         data_l [0] = my_pc;
+         data_l [1] = taken;
+         if fast_write_file(ex_trace,8,data_l) ^= 8 then
+            begin
+               perror("fast_write_file");
+               exit(-1);
+            end;
+      end;
+
+   if (use_itrace) then 
+      begin
+         if fast_read_file(ex_trace,8,data_l) ^= 8 then
+            begin
+               perror("fast_write_file");
+               exit(-1);
+            end;
+
+         if data_l [0] ^= my_pc then
+            begin
+               sprintf(pointer(scratch),"Expecting PC %08x \n",data_l[0]);
+               write(2,pointer(scratch),fast_strlen(scratch));
+               pause;
+            end;
+
+         if taken ^= data_l[1] then 
+            begin
+               sprintf(pointer(scratch),"%08x expecting value %08x, taken is %08x \n",my_pc, data_l [1],taken);
+               write(2,pointer(scratch),fast_strlen(scratch));
+               pause;
+            end;
+      end;
+   retire stat;
+end s_WB;
+
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+#                                                                       #
+#  Floating point add pipeline.                                         #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+
+procedure f_add1 prologue
+begin
+end f_add1;
+
+procedure f_add1 epilogue
+begin
+   send f_add2;
+end f_add1;
+
+procedure f_add2 prologue
+begin
+end f_add2;
+
+procedure f_add2 epilogue
+begin
+   send f_add3;
+end f_add2;
+
+procedure f_add3 prologue
+begin
+end f_add3;
+
+procedure f_add3 epilogue
+begin
+   send s_wb;
+end f_add3;
+
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+#                                                                       #
+#  Floating point multiply pipeline.                                    #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+
+procedure f_mul1 prologue
+begin
+end f_mul1;
+
+procedure f_mul1 epilogue
+begin
+   send f_mul2;
+end f_mul1;
+
+procedure f_mul2 prologue
+begin
+end f_mul2;
+
+procedure f_mul2 epilogue
+begin
+   send f_mul3;
+end f_mul2;
+
+procedure f_mul3 prologue
+begin
+end f_mul3;
+
+procedure f_mul3 epilogue
+begin
+   send s_wb;
+end f_mul3;
+
+procedure boot_up untyped
+begin
+   forall gpr = 0;
+   forall gpr_tag=0;
+ 
+   if use_itrace & generate_itrace then
+      begin
+         printf("Error: both generate_itrace and use_itrace are true\n");
+         exit (-1);
+      end;
+
+   sprintf(pointer(scratch),"%s/z-trace/%s.itrace", getenv("HOME"),myself.benchmark);
+   if (generate_itrace) then 
+      begin
+         ex_trace = fast_open_file(scratch,"output");
+         if ex_trace < 0 then
+            begin
+               perror("Open itrace file for output");
+               printf("Looking for : %s\n",pointer(scratch));
+               exit(-1);
+            end;
+      end;
+   if (use_itrace) then 
+      begin
+         ex_trace = fast_open_file(scratch,"input");
+         if ex_trace < 0 then
+            begin
+               perror("Open itrace file for input");
+               printf("Looking for : %s\n",pointer(scratch));
+               exit(-1);
+            end;
+      end;
+end boot_up;
+
+initialization boot_up;
+
+controlflow
+   bc1f__,
+   beq__,
+   bgez__,
+   bgezal__,
+   bgtz__,
+   blez__,
+   bltz__,
+   bltzal__,
+   bne__,
+   j__,
+   jal__,
+   jalr__,
+   jr__;
+
+instruction category integer_arithmetic
+   add,
+   addi,
+   addiu,
+   addu,
+   and,
+   andi__,
+   div,
+   divu,
+   lui,
+   mfhi,
+   mflo,
+   mult,
+   multu,
+   nor,
+   or,
+   ori,
+   sll,
+   sllv,
+   slt,
+   slti,
+   sltiu,
+   sltu,
+   sra,
+   srav,
+   srl,
+   srlv,
+   sub,
+   subu,
+   xor,
+   xori;
+
+
+instruction category conditional_branch
+   beq__,
+   bgez__,
+   bgezal__,
+   bgtz__,
+   blez__,
+   bltz__,
+   bltzal__,
+   bne__;
+
+instruction category other
+   break;
+
+instruction category unconditional_branch
+   j__,
+   jal__,
+   jalr__,
+   jr__;
+
+instruction category load
+   lb,
+   lbu,
+   lh,
+   lhu,
+   lw,
+   lwl,
+   lwr,
+   lwc1__;
+
+
+instruction category store
+   sb,
+   sh,
+   sw,
+   swl,
+   swr,
+   swc1__;
+
+instruction category float_arithmetic
+   "cvt.d.w",
+   "cvt.d.s",
+   "cvt.s.w",
+   "cvt.s.d",
+   "div.d",
+   "div.s",
+   "mul.s",
+   "mul.d",
+   "add.s",
+   "add.d",
+   "neg.s",
+   "neg.d",
+   "sub.s",
+   "sub.d",
+   mfc1,
+   mtc1,
+   "c.cond.d",
+   "c.cond.s",
+   "abs.s",
+   "abs.d",
+   "mov.s",
+   "mov.d",
+   "trunc.w.s",
+   "trunc.w.d";
+
+instruction category float_conditional
+    bc1f__,
+    bc1t__;
+
+
+# These are the registers we monitor duxecution.
+#
+#
+monitor 
+   gpr,
+   linebreak,
+   linebreak,
+   linebreak,
+   pc;
+end;  # processor 
+
+#- C and C++ supplements. Initialize machine must be provided. - - - - - -#
+#                                                                         #
+#                                                                         #
+#  Simulator supplements.                                                 #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+
+simulator begin
+%%
+word   pseudo_procedure_call;
+word   pseudo_pipeline_flush;
+integer nop_line[4];
+integer nop_flush[4];
+
+extern char ** environ;
+
+void procedure initialize_machine
+    (code_file_header& H,int arg_count,char **args,integer lim)
+begin
+   char * p;
+
+   while (lim & 0x7) lim--;
+   gpr[$sp]=(lim-8);
+
+   pseudo_procedure_call=(word)&nop_line;
+   nop_line[0]=0;
+   nop_line[1]=0;
+   nop_line[2]=0;
+   nop_line[3]=0;
+
+   pseudo_pipeline_flush=(word)&nop_flush;
+   nop_flush[0]=0;
+   nop_flush[1]=0;
+   nop_flush[2]=0;
+   nop_flush[3]=0;
+
+   for (integer i=0; i < fast_ext_count; i++)
+   begin
+      if (strcmp(externals[i].name,"exit")==0) then
+         begin
+            gpr[$ra]=e_ref_table_start + ((integer)&externals[i]-(integer)&externals);
+            break;
+         end
+   end
+   
+   // cout << "Args are : ";
+   // for (integer i=0; i < arg_count; i++) 
+   // cout << args[i] << " ";
+   // cout << "\n";
+   gpr[$a0]=arg_count;
+   gpr[$a1]=(integer)args;
+   gpr[$a2]=(integer)environ;
+   gpr[$gp]=H.sbss_segment_start;
+   gpr[$t9]=0;
+end // initialize_machine //
+%%
+end simulator;
+
+#- C and C++ supplements. - - - - - - - - - - - - - - - - - - - - - - - - #
+#                                                                         #
+#                                                                         #
+#  Assembler supplements.                                                 #
+#- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -#
+
+assembler begin
+%%
+label last_label;
+integer last_offset;
+
+void procedure basic_block_end()
+begin
+   last_label=0;
+end // basic_block_end //
+
+integer procedure absolute_to_base_offset(label l,int which)
+begin
+   if (l->get_name() == 0) then
+      if ((word)which == (word)need_base) then
+         return(0);
+      else
+         return(l->segment_offset+l->offset);
+
+   printf("Absolute to base offset called\n");
+   if ((word)which == (word)need_base) then
+      begin
+         printf("Returning base register for %s\n",l->get_name());
+         return(28);
+      end
+   return(l->segment_offset+l->offset);
+end // absolute_to_base_offset //
+
+integer procedure base_register_for_symbol(label l,label q)
+begin
+   integer off;
+   char    buf[900];
+
+   if (l->l_segment == sbss_segment) then
+      return(28);
+   
+   off=l->segment_offset+l->offset+q->offset;
+   //if (last_label == l && off == last_offset) then
+   //   ; // cout << "same label " << "@ " << yyline << l->get_name() << "\n";
+   //else
+      begin
+         sprintf(buf,"\n la $1,%s %+d\n",q->get_name(),q->offset);
+         scan_macro_buffer(buf,"brfs",false);
+         invoked_macro++;
+      end
+   last_label=l;
+   last_offset=off;
+   // cout << "Base rg for sym " << l->get_name() << "\n";
+   return(1);
+end // base_register_for_symbol //
+
+integer procedure offset_for_symbol(label l,label q)
+begin 
+   integer off;
+
+   if (l->l_segment == sbss_segment) then
+      begin
+         off=l->segment_offset+l->offset+q->offset;
+         if (debug) then
+            begin
+               printf( "offset for ");
+               printf( "%s",l->get_name());
+               printf( " is ");
+               printf( " %d ",off);
+               printf( " in segment ");
+               printf( "%s",segment_name(l->l_segment));
+               printf( "\n");
+            end
+         return(off);
+      end
+   return(0);  // offset is included in the la macro generated by 
+               // base_register_for_symbol procedure.
+end // offset_for_symbol //
+
+void procedure map_base_offset_size_check(label address,integer which)
+begin
+   integer tx,ty,i;
+   char    buf[900];
+
+
+   // if (which == need_base) then
+   //    begin
+   //       address->index=address->base;
+   //       address->base=1;
+   //       return;
+   //    end  
+
+   tx=address->offset;
+   if (tx < -32768 || tx > 32768) then
+      begin
+         if (which == need_base) then
+            begin
+               address->index=address->base;
+               address->base=1;
+               return;
+            end  
+         ty = address->offset;
+         ty = ty >> 16;
+         tx = address->offset;
+         tx = tx & 0xffff;
+
+         // lui : rt=1 immediate=ty;
+         sprintf(buf,"\nlui $1, %d\n",ty);
+         i=strlen(buf);
+
+         // ori : rt=1 rs=1 immediate=tx;
+         sprintf(buf+i,"ori $1,$1,%d\n",tx);
+         i=strlen(buf);
+        
+  
+         // add : rd=1 rs=1 rt=base;
+         if (address->index < 0) then
+            sprintf(buf+i,"add $1,$1,$%d\n",address->base);
+         else
+            sprintf(buf+i,"add $1,$1,$%d\n",address->index);
+
+         scan_macro_buffer(buf,"map-base-offset-size-check",false);
+         invoked_macro++;
+         address->offset=0;
+         address->l_type=base_offset;
+      end;
+end // map_base_offset_size_check //
+
+void procedure map_base_offset_deferred(label address,integer which)
+begin
+   integer tx,ty;
+   char    buf[900];
+
+
+   // cout << "defer: " << address->get_name();
+
+   if (which == need_base) then
+      begin
+         // cout << "needs base; index=" << address->index 
+         //      << " base=" << address->base << "\n";
+         address->index=address->base;
+         address->base=1;
+         return;
+      end  
+
+   // cout << " needs offset\n";
+
+
+   if (address->offset) then
+      sprintf(buf,"\nla $1,%s + %d\n",address->get_name(),address->offset);
+   else
+      sprintf(buf,"\nla $1,%s\n",address->get_name());
+   // cout << "MBOD: " << buf << "\n";
+
+   scan_macro_buffer(buf,"map-base-offset-deferred",false);
+   invoked_macro++;
+
+   // add : rd=1 rs=1 rt=base;
+   if (address->l_type == base_offset_deferred) then
+      begin
+         if (address->index < 0) then
+            sprintf(buf,"add $1,$1,$%d\n",address->base);
+         else
+            sprintf(buf,"add $1,$1,$%d\n",address->index);
+         scan_macro_buffer(buf,"map-base-offset-deferred",false);
+         invoked_macro++;
+      end
+   address->offset=0;
+   address->l_type=base_offset;
+end // map_base_offset_deferred //
+%%
+end assembler;
